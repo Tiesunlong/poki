@@ -147,6 +147,17 @@ struct ActivityPreview: View {
         approval.since = now.addingTimeInterval(-61)
         approval.stepCount = 4
 
+        // `-pokiActivityDemo approvalprotected` and the like: the approval's other questions.
+        func approvalAsking(_ reason: String) -> PokiState {
+            var state = approval
+            state.approval = PendingApproval(id: "a", app: messages, summary: "", reason: reason, expires: now.addingTimeInterval(25))
+            return state
+        }
+        let approvalProtected = approvalAsking("input in Wallet")
+        let approvalPassword = approvalAsking("typing into a password field")
+        let approvalPayment = approvalAsking("a payment (\"pay\")")
+        let approvalDeleting = approvalAsking("deleting a note (\"delete\")")
+
         var deciding = approval
         deciding.phase = .deciding; deciding.decision = true
 
@@ -208,7 +219,8 @@ struct ActivityPreview: View {
         var voiceApproval = approval
         voiceApproval.voice = .listening
 
-        let all = [("start", start), ("working", working), ("step", step), ("approval", approval), ("deciding", deciding), ("yourturn", yourTurn), ("passcode", passcode), ("done", done),
+        let all = [("start", start), ("working", working), ("step", step), ("approval", approval),
+                   ("approvalprotected", approvalProtected), ("approvalpassword", approvalPassword), ("approvalpayment", approvalPayment), ("approvaldeleting", approvalDeleting), ("deciding", deciding), ("yourturn", yourTurn), ("passcode", passcode), ("done", done),
                    ("plan", plan), ("plannext", planNext), ("plandone", planDone),
                    ("ready", ready), ("waking", waking), ("idle", idle), ("problem", problem), ("pairing", pairWait), ("code", pairCode), ("setup", setup), ("voice", voice),
                    ("voiceworking", voiceWorking), ("voiceapproval", voiceApproval)]
@@ -310,7 +322,7 @@ private struct IslandExpandedFrame: View {
             .frame(height: ActivityMetrics.systemCameraRow, alignment: .top)
             IslandBottom(face: face).dynamicTypeSize(...ActivityMetrics.largestType)
         }
-        .frame(width: 374)
+        .frame(width: ActivityMetrics.islandWidth)
         .clipShape(RoundedRectangle(cornerRadius: ActivityMetrics.islandClipCorner).inset(by: ActivityMetrics.islandClip))
         .background(.black, in: shape)
         .clipShape(shape)
@@ -400,6 +412,12 @@ enum DemoActivity {
             Task { @MainActor in await DemoActivity.alert() }
         }, "nz.zheha.poki.demo-alert" as CFString, nil, .deliverImmediately)
         current = (activity, state)
+        // `-pokiActivityAlertAfter 6`: send the alert by itself that many seconds later, which a phone
+        // cannot be told to do from outside (the simulator takes `notifyutil`).
+        if let after = UserDefaults.standard.object(forKey: "pokiActivityAlertAfter") as? Double ?? Double(UserDefaults.standard.string(forKey: "pokiActivityAlertAfter") ?? "") {
+            try? await Task.sleep(for: .seconds(after))
+            await alert()
+        }
         try? await Task.sleep(for: .seconds(28))
     }
 

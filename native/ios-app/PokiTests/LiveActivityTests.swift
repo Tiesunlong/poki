@@ -218,6 +218,44 @@ final class LiveActivityTests: XCTestCase {
         state.approval = PendingApproval(id: "a", app: "Messages", summary: "Tap “Send”", reason: "sending a message (\"send\")", expires: .now.addingTimeInterval(60))
         XCTAssertTrue(state.face.compact.says("Allow?"))
     }
+
+    /// On the expanded island the approval's one question has a column of its own, and a question
+    /// that does not fit it even at the smallest size the title shrinks to is cut off ("Allow a step in a
+    /// protected a..."). Every question, in every language, fits it.
+    func testEveryApprovalQuestionFitsTheIslandsTitleInEveryLanguage() throws {
+        let reasons = [
+            "a payment (\"pay\")", "deleting a note (\"delete\")", "sending a message (\"send\")", "a call (\"call\")",
+            "typing into a password field", "input in Wallet", "multiple sensitive actions: action 1: input in Wallet", "something else",
+        ]
+        let geist = try XCTUnwrap(UIFont(name: "Geist-Bold", size: 20))
+        for language in ["en", "zh-Hans", "zh-Hant"] {
+            AppLocalization.shared.preference = language
+            let english = language == "en"
+            let attributes: [NSAttributedString.Key: Any] = [.font: english ? geist : UIFont.systemFont(ofSize: 20, weight: .bold), .kern: english ? -0.2 : 0]
+            for reason in reasons {
+                var state = PokiState(phase: .approval, headline: "Allow this step?", thumbnailVersion: 0)
+                state.approval = PendingApproval(id: "a", app: "Wallet", summary: "", reason: reason, expires: .now.addingTimeInterval(60))
+                let face = state.face
+                let width = (face.content as NSString).size(withAttributes: attributes).width
+                XCTAssertLessThanOrEqual(width * ActivityMetrics.titleMinimumScale, ActivityMetrics.islandTitleWidth(face),
+                                         "\(language): \(face.content) is \(width) points wide")
+            }
+        }
+    }
+
+    /// Geist has no Chinese. In an English interface a step the agent words in Chinese, or an app
+    /// named in Chinese, is set in the system font like the Chinese interface's lines, and not in Geist's
+    /// metrics with a fallback font's glyphs, which cut the line's end off.
+    func testALineGeistCannotDrawIsSetInTheSystemFontWhateverTheInterfaceLanguage() {
+        let theme = ActivityTheme()
+        XCTAssertTrue(ActivityTheme.geistDraws("Tap “Send” in Messages…"))
+        XCTAssertFalse(ActivityTheme.geistDraws("打开微信"))
+        XCTAssertFalse(ActivityTheme.geistDraws("Open 微信"))
+        XCTAssertEqual(theme.titleTracking(for: "Open Messages"), -0.2, "English words in an English interface keep Geist")
+        XCTAssertEqual(theme.titleTracking(for: "打开微信"), 0)
+        AppLocalization.shared.preference = "zh-Hans"
+        XCTAssertEqual(theme.titleTracking(for: "Open Messages"), 0, "A Chinese interface keeps the system font")
+    }
 }
 
 private extension ActivityFace.Compact {

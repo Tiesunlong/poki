@@ -601,10 +601,18 @@ struct HomePage<Footer: View>: View {
     /// phone runs hot and while the keyboard is up, and its clock stops when the page is not in front or the drawer is open. With VoiceOver it is a plain row, each pill
     /// once. The two ends fade out over 32 points, glass included. The first row starts a little way
     /// along, so the two rows do not line up.
-    private func row(_ ideas: [HomeShortcut], at index: Int, speed: Double, start: CGFloat) -> some View {
-        Marquee(speed: speed, spacing: 8, start: start, edgeFade: 32, running: !reduceMotion && !DeviceStrain.shared.resting && !writing && !PerfSwitch.on(.pillsStill),
-                active: home && scenePhase == .active && !covered, loops: !voiceOver, stopped: busy) {
-            ForEach(ideas) { idea in shortcut(idea, row: index) }
+    @ViewBuilder private func row(_ ideas: [HomeShortcut], at index: Int, speed: Double, start: CGFloat) -> some View {
+        if DiagFlags.has("marqueeOff") {
+            // TEMPORARY (launch hang diagnosis): the row as a plain line of pills, no scroll view.
+            HStack(spacing: 8) { ForEach(ideas) { idea in shortcut(idea, row: index) } }
+                .padding(.horizontal, 20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
+        } else {
+            Marquee(speed: speed, spacing: 8, start: start, edgeFade: 32, running: !reduceMotion && !DeviceStrain.shared.resting && !writing && !PerfSwitch.on(.pillsStill),
+                    active: home && scenePhase == .active && !covered, loops: !voiceOver, stopped: busy) {
+                ForEach(ideas) { idea in shortcut(idea, row: index) }
+            }
         }
     }
 

@@ -33,6 +33,37 @@ jobs:
           name: Poki-unsigned
           path: out/
           if-no-files-found: error
+      # TEMPORARY (iPhone Duo launch hang diagnosis): the app's own executable alone, small enough to
+      # fetch over a slow link and swap into the IPA fetched before; the unstripped one for atos.
+      - name: Executable alone
+        run: |
+          set -euo pipefail
+          rm -rf bin-out && mkdir -p bin-out/x && cd bin-out
+          unzip -q -o ../out/Poki-external-unsigned.ipa 'Payload/Poki.app/Poki' -d x
+          cp x/Payload/Poki.app/Poki Poki.unstripped
+          strip -x x/Payload/Poki.app/Poki
+          if command -v xz >/dev/null; then
+            xz -9 -T0 -c x/Payload/Poki.app/Poki > Poki.stripped.xz
+            xz -9 -T0 -c Poki.unstripped > Poki.unstripped.xz
+          else
+            gzip -9 -c x/Payload/Poki.app/Poki > Poki.stripped.gz
+            gzip -9 -c Poki.unstripped > Poki.unstripped.gz
+          fi
+          shasum -a 256 x/Payload/Poki.app/Poki Poki.unstripped | sed 's#x/Payload/Poki.app/##' > SHA256SUMS
+          rm -rf x Poki.unstripped
+          ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Poki-bin
+          path: |
+            bin-out/Poki.stripped.*
+            bin-out/SHA256SUMS
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Poki-bin-symbols
+          path: bin-out/Poki.unstripped.*
+          compression-level: 0
       # Only main's caches reach other branches and tags; a branch's own help its next run.
       - if: steps.build.outputs.rust-hit != 'true'
         uses: actions/cache/save@v4

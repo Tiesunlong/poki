@@ -128,6 +128,16 @@ final class MarqueeScrollView: UIScrollView {
         host.view.backgroundColor = .clear
         host.safeAreaRegions = []
         addSubview(host.view)
+        // iOS 26 and later: a bar's scroll pocket gives the scroll views under it the system's edge
+        // effect, a view laid over the scroll view. This row fades its own ends (`fade`) and takes none.
+        // (iPhone Duo, iOS 27.2.1, large text: the row and the effect laid each other out without end on
+        // the first frame, and iOS stopped Poki after 20 s.) `marqueeEdgeEffects` in pki-flags keeps it.
+        if #available(iOS 26.0, *), !DiagFlags.has("marqueeEdgeEffects") {
+            topEdgeEffect.isHidden = true
+            leftEdgeEffect.isHidden = true
+            bottomEdgeEffect.isHidden = true
+            rightEdgeEffect.isHidden = true
+        }
         registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (view: MarqueeScrollView, _: UITraitCollection) in
             view.stale = true
             view.setNeedsLayout()

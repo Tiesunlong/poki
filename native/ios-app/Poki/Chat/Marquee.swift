@@ -128,16 +128,6 @@ final class MarqueeScrollView: UIScrollView {
         host.view.backgroundColor = .clear
         host.safeAreaRegions = []
         addSubview(host.view)
-        // iOS 26 and later: a bar's scroll pocket gives the scroll views under it the system's edge
-        // effect, a view laid over the scroll view. This row fades its own ends (`fade`) and takes none.
-        // (iPhone Duo, iOS 27.2.1, large text: the row and the effect laid each other out without end on
-        // the first frame, and iOS stopped Poki after 20 s.) `marqueeEdgeEffects` in pki-flags keeps it.
-        if #available(iOS 26.0, *), !DiagFlags.has("marqueeEdgeEffects") {
-            topEdgeEffect.isHidden = true
-            leftEdgeEffect.isHidden = true
-            bottomEdgeEffect.isHidden = true
-            rightEdgeEffect.isHidden = true
-        }
         registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (view: MarqueeScrollView, _: UITraitCollection) in
             view.stale = true
             view.setNeedsLayout()
@@ -199,9 +189,18 @@ final class MarqueeScrollView: UIScrollView {
         if stale || laidWidth != bounds.width { measure() }
         placeFade()
         guard loops, period > 0 else { return }
+        // Folded back up only once a pixel below the second copy. The scroll view puts its position
+        // on whole pixels each time it sets it itself, as it does when the layout around it sets its
+        // frame again, which a fold brings about. A period that ends on half a pixel (large bold
+        // text: 1120.83 points, 3362.5 pixels on a 3x screen) folded down to the period exactly was
+        // put half a pixel below it, folded up to just under two periods, put on two periods, folded
+        // down again, and so on without end inside the first frame: iOS stopped Poki after 20 s (an
+        // iPhone Duo, iOS 27.2.1). With a pixel to spare, each fold lands a pixel inside the other end,
+        // out of that rounding's reach of half a pixel. `marqueeOldFold` in pki-flags takes it away.
+        let slack = DiagFlags.has("marqueeOldFold") ? 0 : 1 / max(traitCollection.displayScale, 1)
         var x = bounds.origin.x
         while x >= 2 * period { x -= period }
-        while x < period { x += period }
+        while x < period - slack { x += period }
         if x != bounds.origin.x { bounds.origin.x = x }
     }
 

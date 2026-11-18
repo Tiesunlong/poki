@@ -829,30 +829,33 @@ async fn read_live(
     .await?;
     let result = tokio::time::timeout(wait, async {
         let mut id = 2;
-        let pid = live_application(&mut socket, &mut id, display).await?;
-        let app = live_query(
-            &mut socket,
-            &mut id,
-            1,
-            Value::Dictionary(plist::Dictionary::from_iter([(
-                "pid".to_string(),
-                Value::from(pid),
-            )])),
-            None,
-        )
-        .await?;
-        let root = app
-            .field(app.root(), "resultData")
-            .ok_or("AX application reference missing")?
-            .clone();
-        let mut pending = vec![(app, root)];
+        let pids = live_applications(&mut socket, &mut id, display).await?;
+        let mut pending = std::collections::VecDeque::new();
         let mut visited = HashSet::new();
         let mut tree = Tree {
             include_offscreen,
             orientation: display.orientation,
             ..Tree::default()
         };
-        tree.update(&pending[0].0)?;
+        for pid in &pids {
+            let app = live_query(
+                &mut socket,
+                &mut id,
+                1,
+                Value::Dictionary(plist::Dictionary::from_iter([(
+                    "pid".to_string(),
+                    Value::from(*pid),
+                )])),
+                None,
+            )
+            .await?;
+            let root = app
+                .field(app.root(), "resultData")
+                .ok_or("AX application reference missing")?
+                .clone();
+            tree.update(&app)?;
+            pending.push_back((app, root));
+        }
         let attrs = Value::Dictionary(plist::Dictionary::from_iter([(
             "attributes".to_string(),
             Value::Array(
@@ -864,18 +867,18 @@ async fn read_live(
                 .collect(),
             ),
         )]));
-        while let Some((source, translation)) = pending.pop() {
+        while let Some((source, translation)) = pending.pop_front() {
             let object = source
                 .field(&translation, "objectID")
                 .and_then(|v| source.integer(v))
                 .ok_or("AX reference missing identity")?;
-            if !visited.insert(object) {
+            if visited.contains(&object) {
                 continue;
             }
-            // shortcut: bound live walks to 256 elements; use a display-aware cached service for larger trees.
-            if visited.len() > 256 {
-                return Err("AX tree exceeded 256 elements".into());
+            if visited.len() >= 768 {
+                break;
             }
+            visited.insert(object);
             let a = live_query(
                 &mut socket,
                 &mut id,
@@ -900,7 +903,7 @@ async fn read_live(
                 children = children_for(8);
             }
             for child in children {
-                pending.push((
+                pending.push_back((
                     Archive {
                         value: a.value.clone(),
                     },
@@ -908,7 +911,7 @@ async fn read_live(
                 ));
             }
         }
-        if live_application(&mut socket, &mut id, display).await? != pid {
+        if live_applications(&mut socket, &mut id, display).await? != pids {
             return Err("AX app changed during read".into());
         }
         let after = super::display::active(adapter, rsd)
@@ -936,12 +939,12 @@ async fn read_live(
     result.map_err(|_| "Live AX tree timed out")?
 }
 
-async fn live_application(
+async fn live_applications(
     socket: &mut impl ReadWrite,
     id: &mut u32,
     display: &super::display::Display,
-) -> Result<u64> {
-    let mut selected = None;
+) -> Result<Vec<u64>> {
+    let mut selected = Vec::new();
     for fraction in [0.25, 0.5, 0.75] {
         let params = Value::Dictionary(plist::Dictionary::from_iter([
             ("displayId", Value::from(display.id)),
@@ -955,20 +958,20 @@ async fn live_application(
             ),
         ]));
         let a = live_query(socket, id, 6, params, None).await?;
-        let pid = a
+        if let Some(pid) = a
             .field(a.root(), "resultData")
             .and_then(|v| a.field(v, "pid"))
             .and_then(|v| a.integer(v))
             .filter(|pid| *pid > 0)
-            .ok_or("AX hit test returned no application")?;
-        if selected.is_some_and(|before| before != pid) {
-            return Err(
-                "Multiple applications on the active display; refusing ambiguous AX input".into(),
-            );
+            && !selected.contains(&pid)
+        {
+            selected.push(pid);
         }
-        selected = Some(pid);
     }
-    selected.ok_or_else(|| "AX application not found".into())
+    if selected.is_empty() {
+        return Err("AX hit test returned no application".into());
+    }
+    Ok(selected)
 }
 
 #[cfg(test)]

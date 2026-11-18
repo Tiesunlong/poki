@@ -46,6 +46,7 @@ struct ChatView: View {
     /// The message field has the keyboard.
     @State private var writing = false
     @State private var standaloneDraft = ""
+    @State private var pickedShortcut: HomeShortcut?
     private var draft: Binding<String> { sharedDraft ?? $standaloneDraft }
     /// Taps on New Conversation on the home page, for the message field (`ComposerInputView.restarts`).
     @State private var restarts = 0
@@ -124,7 +125,13 @@ struct ChatView: View {
             // The home page stays in the tree while the conversation is in front, neither seen nor
             // touched, so a new conversation brings it back on the same animation.
             HomePage(home: home, writing: writing, rise: flightRise, sessionStore: sessionStore, shortcutStore: shortcutStore,
-                     pick: { model.prepareForTask(); chat.setDraftActivity(true); draft.wrappedValue = $0; writing = true }) {
+                     pick: { shortcut in
+                         model.prepareForTask()
+                         chat.setDraftActivity(true)
+                         pickedShortcut = shortcut
+                         draft.wrappedValue = shortcut.prompt
+                         writing = true
+                     }) {
                 if home, let update { UpdatePill(version: update, open: openUpdates) }
                 if home, let hint = homeHint {
                     SetupHintLine(hint: hint, openSetupStep: openSetupStep, openSetup: openSetup, openModel: openModel,
@@ -151,7 +158,10 @@ struct ChatView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 ComposerInputView(input: draft, focused: $writing, running: busy, progress: progress, restarts: restarts,
-                                  send: { chat.send($0, attachments: $1) }, stop: chat.stop, openVoice: openVoice, openVoiceKey: openVoiceKey,
+                                  send: { text, attachments in
+                                      chat.send(text, attachments: attachments, suggestedApp: pickedShortcut?.target(for: text))
+                                      pickedShortcut = nil
+                                  }, stop: chat.stop, openVoice: openVoice, openVoiceKey: openVoiceKey,
                                   noticeHeight: max(120, pageHeight * 0.6))
             }
             .padding(.horizontal, 18).padding(.top, 6).padding(.bottom, 10)

@@ -158,6 +158,8 @@ final class ChatModel {
     private var toolRoute: ToolRoute?
     private var usesSplitView = false
     private var splitViewSession: String?
+    private var companionTarget: String?
+    private var loopCompanionTarget: String?
     var isRunningInSplitView: Bool { running && usesSplitView }
     private var hasSplitViewRead = false
     private var lastSplitViewSide: String?
@@ -327,19 +329,21 @@ final class ChatModel {
 
     /// A message with photos or PDFs from the plus menu: the model reads their pictures with the words.
     /// The words may be left out.
-    func send(_ text: String, attachments: [ChatAttachment]) {
+    func send(_ text: String, attachments: [ChatAttachment], suggestedApp: KnownApp? = nil) {
         lastImages = attachments.flatMap(\.images)
         let documents = attachments.compactMap { attachment in
             attachment.textContent.map { ChatTextDocument(name: attachment.label, content: $0) }
         }
-        send(text, again: false, thumbnails: attachments.filter { !$0.thumbnail.isEmpty }.map(\.thumbnail), documents: documents, chooseWorkspace: true)
+        send(text, again: false, thumbnails: attachments.filter { !$0.thumbnail.isEmpty }.map(\.thumbnail), documents: documents,
+             chooseWorkspace: true, suggestedApp: suggestedApp)
     }
 
     /// The last message again, after a problem (the Retry button under it).
     func retry() {
         guard !running, let last = entries.last(where: { if case .you = $0.kind { return true }; return false }), case .you(let text, _) = last.kind else { return }
         while let tail = entries.last, case .note(.problem) = tail.kind { entries.removeLast() }
-        send(text, again: true, documents: last.textDocuments ?? [], inSplitView: usesSplitView && expectedSplitViewApps == nil, chooseWorkspace: true)
+        send(text, again: true, documents: last.textDocuments ?? [], inSplitView: usesSplitView && expectedSplitViewApps == nil,
+             chooseWorkspace: true, suggestedApp: lastSuggestedApp?.text == text ? lastSuggestedApp?.app : nil)
     }
 
     /// The conversation ended on a problem the owner can try again.
@@ -352,6 +356,7 @@ final class ChatModel {
     private static let picturesOnly = "(The owner sent the attached pictures without a message.)"
     /// The pictures of the owner's last message, sent again with it by Try Again.
     private var lastImages: [Data] = []
+    private var lastSuggestedApp: (text: String, app: KnownApp)?
 
     /// Keep captions and file contents separate until the approval context is packed.
     var ownerContext: [ApprovalClassifier.ContextTurn] {
@@ -369,24 +374,22 @@ final class ChatModel {
     }
 
     private struct PreparedSend {
-        enum Engine {
-            case direct(ModelClient, String)
-            case pi(Model)
-        }
         let text: String
         let you: ChatEntry
         let message: String
         let runSession: String
         let provider: ModelProvider
         let model: String
+        let key: String
         let resumedTask: String?
         let inSplitView: Bool
+        let chooseWorkspace: Bool
+        let suggestedApp: KnownApp?
         let images: [Data]
-        let namedApps: [String]
-        let engine: Engine
     }
 
-    private func send(_ text: String, again: Bool, thumbnails: [Data] = [], documents: [ChatTextDocument] = [], inSplitView: Bool = false, chooseWorkspace: Bool = false) {
+    private func send(_ text: String, again: Bool, thumbnails: [Data] = [], documents: [ChatTextDocument] = [], inSplitView: Bool = false,
+                      chooseWorkspace: Bool = false, suggestedApp: KnownApp? = nil) {
         if let message = app.signer.installMessage {
             add(.note(.problem(message)))
             return
@@ -394,6 +397,7 @@ final class ChatModel {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         // Pictures may go without words, and Try Again sends them again.
         guard !text.isEmpty || !documents.isEmpty || !thumbnails.isEmpty || (again && !lastImages.isEmpty), !running else { return }
+        lastSuggestedApp = suggestedApp.map { (text, $0) }
         if isDemo { playDemo(text); return }
         // Another conversation (an outside agent's hand-off) is working the phone: one task at a time.
         if kind == .poki, let busy = ChatModel.delegatedBusy {
@@ -430,7 +434,8 @@ final class ChatModel {
                 }
                 self.lastImages = capturedImages
                 guard let prepared = self.prepareSend(text, again: again, thumbnails: thumbnails, documents: documents,
-                                                      inSplitView: inSplitView, chooseWorkspace: chooseWorkspace) else {
+                                                      inSplitView: inSplitView, chooseWorkspace: chooseWorkspace,
+                                                      suggestedApp: suggestedApp) else {
                     self.running = false
                     self.awaitingModel = false
                     return
@@ -440,7 +445,8 @@ final class ChatModel {
             return
         }
         guard let prepared = prepareSend(text, again: again, thumbnails: thumbnails, documents: documents,
-                                         inSplitView: inSplitView, chooseWorkspace: chooseWorkspace) else { return }
+                                         inSplitView: inSplitView, chooseWorkspace: chooseWorkspace,
+                                         suggestedApp: suggestedApp) else { return }
         running = true
         awaitingModel = true
         stopAsked = false
@@ -456,7 +462,7 @@ final class ChatModel {
     }
 
     private func prepareSend(_ text: String, again: Bool, thumbnails: [Data], documents: [ChatTextDocument],
-                             inSplitView: Bool, chooseWorkspace: Bool) -> PreparedSend? {
+                             inSplitView: Bool, chooseWorkspace: Bool, suggestedApp: KnownApp?) -> PreparedSend? {
         var resumedTask: String?
         if kind == .poki, thumbnails.isEmpty, lastImages.isEmpty {
             switch ChatContinuation.resolve(text, current: sessionID, choices: entries.last?.continuationChoices,
@@ -500,6 +506,7 @@ final class ChatModel {
         usesSplitView = inSplitView
         splitViewSession = inSplitView ? UUID().uuidString : nil
         expectedSplitViewApps = nil
+        companionTarget = nil
         hasSplitViewRead = false
         lastSplitViewSide = nil
         lastSplitViewLayout = nil
@@ -513,6 +520,11 @@ final class ChatModel {
         }
         let runSession = sessionID
         let model = ModelKeys.selectedModel
+        let canUseDirect = !inSplitView && Self.direct && (provider == .anthropic || provider == .openai)
+        if !canUseDirect, provider.piModel(model) == nil {
+            add(.note(.problem(AppLocalization.text(LocalizedStringResource("pi has no model \(model) for \(provider.name).")))))
+            return nil
+        }
         // The first message names the chat: a few words from the chat's own model, in the background.
         if kind == .poki, !again, entries.filter({ if case .you = $0.kind { return true }; return false }).count == 1,
            let piModel = provider.piModel(model) {
@@ -523,33 +535,34 @@ final class ChatModel {
         planID = nil; noteID = nil; modelPlan = nil
         taskApp = nil
         taskApps = TaskApps(); taskRequest = resumedTask ?? text; toolRoute = nil
-        let continuation = resumedTask.map { "The owner selected this saved task to resume: \($0). Recheck the current screen and continue from the saved progress; do not substitute a task from long-term memory." }
         let images = lastImages
-        let namedApps = chooseWorkspace && kind == .poki && app.canPlanSplitView
-            ? AppIconStore.bundleIDs(namedIn: text) : []
-        if !inSplitView, namedApps.count < 2, Self.direct, provider == .anthropic || provider == .openai {
-            let instructions = [Harness.instructions(for: resumedTask ?? text), restoredContext, continuation].compactMap { $0 }.joined(separator: "\n\n")
-            // Another model starts a new conversation on the model's side; the chat on screen stays.
-            if client?.signature != "\(provider.rawValue)/\(model)" {
-                client = provider == .openai ? OpenAIClient(key: key, model: model) : AnthropicClient(key: key, model: model)
-            }
-            guard let client else { return nil }
-            return PreparedSend(text: text, you: you, message: message, runSession: runSession, provider: provider, model: model,
-                                resumedTask: resumedTask, inSplitView: inSplitView, images: images, namedApps: namedApps,
-                                engine: .direct(client, instructions))
-        }
-        guard let piModel = provider.piModel(model) else {
-            add(.note(.problem(AppLocalization.text(LocalizedStringResource("pi has no model \(model) for \(provider.name).")))))
-            return nil
-        }
         return PreparedSend(text: text, you: you, message: message, runSession: runSession, provider: provider, model: model,
-                            resumedTask: resumedTask, inSplitView: inSplitView, images: images, namedApps: namedApps,
-                            engine: .pi(piModel))
+                            key: key, resumedTask: resumedTask, inSplitView: inSplitView, chooseWorkspace: chooseWorkspace,
+                            suggestedApp: suggestedApp, images: images)
     }
 
     private func executePreparedSend(_ prepared: PreparedSend, token: Int) async {
-        switch prepared.engine {
-        case .direct(let client, let instructions):
+        let effectiveText = prepared.resumedTask ?? prepared.text
+        let continuation = prepared.resumedTask.map { "The owner selected this saved task to resume: \($0). Recheck the current screen and continue from the saved progress; do not substitute a task from long-term memory." }
+        let userChat = !prepared.inSplitView && prepared.chooseWorkspace && kind == .poki
+        let installed = userChat && prepared.suggestedApp == nil ? await app.installedApplicationNames() : nil
+        guard runToken == token, !Task.isCancelled else { return }
+        let namedApps = AppIconStore.workspaceApps(namedIn: effectiveText, installed: installed, suggested: prepared.suggestedApp)
+        let canPlan = if userChat, !namedApps.isEmpty { await app.prepareWorkspacePlanning() } else { false }
+        guard runToken == token, !Task.isCancelled else { return }
+        let placement = canPlan ? app.duoChatPlacement : nil
+        if userChat, prepared.suggestedApp == nil, app.canPlanSplitView {
+            AppLog.shared.add("chat", "installed app inventory: \(installed == nil ? "unavailable" : "available"); matched apps: \(namedApps.count)")
+        }
+        let hints = installed != nil || prepared.suggestedApp != nil ? namedApps : nil
+        let needsWorkspacePlan = canPlan && !namedApps.isEmpty && (namedApps.count >= 2 || placement != nil)
+        if !prepared.inSplitView, !needsWorkspacePlan, Self.direct, prepared.provider == .anthropic || prepared.provider == .openai {
+            let instructions = [Harness.instructions(for: effectiveText, targetApps: hints), restoredContext, continuation].compactMap { $0 }.joined(separator: "\n\n")
+            // Another model starts a new conversation on the model's side; the chat on screen stays.
+            if client?.signature != "\(prepared.provider.rawValue)/\(prepared.model)" {
+                client = prepared.provider == .openai ? OpenAIClient(key: prepared.key, model: prepared.model) : AnthropicClient(key: prepared.key, model: prepared.model)
+            }
+            guard let client else { running = false; awaitingModel = false; return }
             client.say(prepared.message)
             began("direct", prepared.provider, prepared.model)
             await run(client, instructions: instructions, delivered: prepared.you.id, token: token)
@@ -557,84 +570,192 @@ final class ChatModel {
             if !current { app.finishTask() }
             logEnd("direct", outcome: nil, session: prepared.runSession, text: prepared.text, stopped: !current)
             if current { running = false; awaitingModel = false }
-        case .pi(let piModel):
-            var pair: [String] = []
-            if !prepared.inSplitView, prepared.namedApps.count >= 2 {
-                let plannedAt = ContinuousClock.now
-                let choice = await chooseSplitView(text: prepared.text, apps: prepared.namedApps, provider: prepared.provider, model: piModel)
-                guard runToken == token else { return }
-                AppLog.shared.add("chat", "workspace planning took \(plannedAt.duration(to: .now))")
-                switch choice {
-                case .split(let apps):
-                    pair = apps
-                    usesSplitView = true
-                    splitViewSession = UUID().uuidString
-                    expectedSplitViewApps = Set(apps)
-                    AppLog.shared.add("chat", "workspace planning selected Split View")
-                case .normal:
-                    AppLog.shared.add("chat", "workspace planning selected normal chat")
-                case .failed(let words):
-                    AppLog.shared.add("chat", "workspace planning failed before any phone action")
-                    add(.note(.problem(words)))
-                    running = false
-                    awaitingModel = false
-                    lastOutcome = .failed(words)
-                    return
-                }
-            }
-            let splitSession = splitViewSession
-            began("pi", prepared.provider, prepared.model, splitViewSession: splitSession)
-            if let splitSession, pair.count == 2 {
-                phoneStepUnderWay = true
-                let confirmed = await openSplitViewPair(pair, session: splitSession, token: token)
-                phoneStepUnderWay = false
-                guard runToken == token, confirmed else {
-                    await app.finishSplitViewTask(localSession: splitSession, pairConfirmed: false) {
-                        self.runToken != token || Task.isCancelled
-                    }
-                    if runToken == token {
-                        AppLog.shared.add("chat", "workspace planning could not confirm the requested Split View apps")
-                        let words = Self.splitViewSetupMessage(pair[0], pair[1])
-                        let outcome = PiLoop.Outcome.failed(words)
-                        ended(outcome, delivered: prepared.you.id)
-                        logEnd("pi", outcome: outcome, session: prepared.runSession, text: prepared.text, stopped: false)
-                        running = false
-                        awaitingModel = false
-                        lastOutcome = outcome
-                    }
-                    return
-                }
-                AppLog.shared.add("chat", "workspace planning confirmed the requested Split View apps")
-            }
-            let loop = modelLoop(provider: prepared.provider, model: piModel, inSplitView: splitSession != nil)
-            let continuation = prepared.resumedTask.map { "The owner selected this saved task to resume: \($0). Recheck the current screen and continue from the saved progress; do not substitute a task from long-term memory." }
-            let instructions = [Harness.instructions(for: prepared.resumedTask ?? prepared.message, inSplitView: splitSession != nil), restoredContext, continuation].compactMap { $0 }.joined(separator: "\n\n")
-            let outcome = await loop.run(prepared.message.isEmpty ? Self.picturesOnly : prepared.message, images: prepared.images, instructions: instructions, maxTurns: Self.maxTurns) { [weak self] text in
-                guard let self, self.runToken == token else { return }
-                self.markDelivered(prepared.you.id)
-                self.awaitingModel = false
-                self.add(.poki(text))
-            }
-            if let splitSession {
-                await app.finishSplitViewTask(localSession: splitSession) {
-                    self.runToken != token || Task.isCancelled || outcome == .stopped
-                }
-            }
-            let current = runToken == token
-            if current { ended(outcome, delivered: prepared.you.id) } else if splitSession == nil { app.finishTask() }
-            logEnd("pi", outcome: outcome, session: prepared.runSession, text: prepared.text, stopped: !current)
-            guard current else { return }
+            return
+        }
+        guard let piModel = prepared.provider.piModel(prepared.model) else {
             running = false
             awaitingModel = false
-            lastOutcome = outcome
+            add(.note(.problem(AppLocalization.text(LocalizedStringResource("pi has no model \(prepared.model) for \(prepared.provider.name).")))))
+            return
         }
+        let launchApps = Dictionary(uniqueKeysWithValues: namedApps.map { ($0.id, $0) })
+        var pair: [String] = []
+        if needsWorkspacePlan {
+            let plannedAt = ContinuousClock.now
+            let choice = await chooseSplitView(text: effectiveText, apps: namedApps, allowCompanion: placement != nil,
+                                               provider: prepared.provider, model: piModel)
+            guard runToken == token else { return }
+            AppLog.shared.add("chat", "workspace planning took \(plannedAt.duration(to: .now))")
+            switch choice {
+            case .split(let apps):
+                pair = apps
+                usesSplitView = true
+                splitViewSession = UUID().uuidString
+                expectedSplitViewApps = Set(apps)
+                AppLog.shared.add("chat", "workspace planning selected Split View")
+            case .companion(let bundle):
+                companionTarget = bundle
+                usesSplitView = true
+                splitViewSession = UUID().uuidString
+                expectedSplitViewApps = Set([bundle, Bundle.main.bundleIdentifier ?? ""])
+                AppLog.shared.add("chat", "workspace planning selected the companion pane")
+            case .normal:
+                AppLog.shared.add("chat", "workspace planning selected normal chat")
+            case .failed(let words):
+                AppLog.shared.add("chat", "workspace planning failed before any phone action")
+                add(.note(.problem(words)))
+                running = false
+                awaitingModel = false
+                lastOutcome = .failed(words)
+                return
+            }
+        }
+        let splitSession = splitViewSession
+        began("pi", prepared.provider, prepared.model, splitViewSession: splitSession)
+        var openingLook: PokiCore.ToolAnswer?
+        if let splitSession, pair.count == 2 || companionTarget != nil {
+            phoneStepUnderWay = true
+            let confirmed: Bool
+            let setupMessage: String
+            if let target = companionTarget {
+                if let placement, let launchApp = launchApps[target] {
+                    confirmed = await openCompanionApp(launchApp, placement: placement, session: splitSession, token: token) {
+                        openingLook = $0
+                    }
+                } else {
+                    confirmed = false
+                }
+                let name = launchApps[target]?.name(in: .current) ?? target
+                setupMessage = AppLocalization.text(LocalizedStringResource("Poki couldn't open \(name) beside the chat. Keep the iPhone unfolded and try again."))
+            } else {
+                confirmed = await openSplitViewPair(pair, launchApps: launchApps, session: splitSession, token: token)
+                setupMessage = Self.splitViewSetupMessage(pair[0], pair[1])
+            }
+            phoneStepUnderWay = false
+            guard runToken == token, confirmed else {
+                await app.finishSplitViewTask(localSession: splitSession, pairConfirmed: false) {
+                    self.runToken != token || Task.isCancelled
+                }
+                if runToken == token {
+                    AppLog.shared.add("chat", "workspace planning could not confirm the requested Split View apps")
+                    let outcome = PiLoop.Outcome.failed(setupMessage)
+                    ended(outcome, delivered: prepared.you.id)
+                    logEnd("pi", outcome: outcome, session: prepared.runSession, text: prepared.text, stopped: false)
+                    running = false
+                    awaitingModel = false
+                    lastOutcome = outcome
+                }
+                return
+            }
+            AppLog.shared.add("chat", "workspace planning confirmed the requested Split View apps")
+        }
+        let loop = modelLoop(provider: prepared.provider, model: piModel, inSplitView: splitSession != nil)
+        if let read = openingLook?.splitView { recordSplitViewRead(read) }
+        let instructions = [Harness.instructions(for: prepared.resumedTask ?? prepared.message, inSplitView: splitSession != nil,
+                                                 alongsidePoki: companionTarget != nil, targetApps: hints), restoredContext, continuation].compactMap { $0 }.joined(separator: "\n\n")
+        let outcome = await loop.run(prepared.message.isEmpty ? Self.picturesOnly : prepared.message, images: prepared.images,
+                                     instructions: instructions, maxTurns: Self.maxTurns, openingLook: openingLook) { [weak self] text in
+            guard let self, self.runToken == token else { return }
+            self.markDelivered(prepared.you.id)
+            self.awaitingModel = false
+            self.add(.poki(text))
+        }
+        if let splitSession {
+            await app.finishSplitViewTask(localSession: splitSession) {
+                self.runToken != token || Task.isCancelled || outcome == .stopped
+            }
+        }
+        let current = runToken == token
+        if current { ended(outcome, delivered: prepared.you.id) } else if splitSession == nil { app.finishTask() }
+        logEnd("pi", outcome: outcome, session: prepared.runSession, text: prepared.text, stopped: !current)
+        guard current else { return }
+        running = false
+        awaitingModel = false
+        lastOutcome = outcome
     }
 
-    private enum WorkspaceChoice { case split([String]), normal, failed(String) }
+    private enum WorkspaceChoice { case split([String]), companion(String), normal, failed(String) }
 
     private enum PairCheck { case confirmed, unavailable, differentPair, stopped }
 
-    private func openSplitViewPair(_ pair: [String], session: String, token: Int) async -> Bool {
+    private func openCompanionApp(_ targetApp: KnownApp, placement: String, session: String, token: Int,
+                                  onRead: ((PokiCore.ToolAnswer) -> Void)? = nil) async -> Bool {
+        guard await app.reserveSplitViewWorkspace(session: session), runToken == token, !Task.isCancelled else { return false }
+        let target = targetApp.id
+        let currentTask = task
+        let background = UIApplication.shared.beginBackgroundTask(withName: "Open Poki Companion App") { currentTask?.cancel() }
+        defer { if background != .invalid { UIApplication.shared.endBackgroundTask(background) } }
+        let labels = [targetApp.english, targetApp.simplified, targetApp.traditional]
+        let dockedPlacement: String
+        if placement == "full" {
+            guard app.duoChatPlacement == "full",
+                  (try? await app.dockChatBesideLauncher(session: session)) == true else { return false }
+            let deadline = ContinuousClock.now + .seconds(6)
+            while runToken == token, !Task.isCancelled, app.duoChatPlacement == "full", ContinuousClock.now < deadline {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            guard let current = app.duoChatPlacement, current == "left" || current == "right" else { return false }
+            dockedPlacement = current
+        } else {
+            dockedPlacement = placement
+        }
+        guard runToken == token, !Task.isCancelled, app.duoChatPlacement == dockedPlacement else { return false }
+        let targetSide = dockedPlacement == "left" ? "right" : "left"
+        if let onRead, placement != "full",
+           let read = await confirmCompanionApp(target, side: targetSide, session: session, token: token) {
+            onRead(read)
+            return true
+        }
+        guard await app.clearSplitViewPaneForSetup(session: session), runToken == token, !Task.isCancelled else { return false }
+        do {
+            guard try await app.openCompanionLauncherItem(labels: [], side: targetSide, session: session) else { return false }
+            let deadline = ContinuousClock.now + .seconds(8)
+            var opened = false
+            var dismissedSwitcher = false
+            repeat {
+                try await Task.sleep(for: .milliseconds(350))
+                try Task.checkCancellation()
+                guard runToken == token, app.duoChatPlacement == dockedPlacement else { return false }
+                // A physical icon tap selects the pane even if iOS still remembers a different
+                // launch position for the app. Use bundle activation only from a verified launcher.
+                if try await app.openCompanionLauncherItem(labels: labels, side: targetSide, session: session) {
+                    opened = true
+                    break
+                }
+                guard runToken == token, !Task.isCancelled else { return false }
+                if try await app.openCompanionLauncherItem(labels: [], side: targetSide, bundle: target, session: session) {
+                    opened = true
+                    break
+                }
+                if !dismissedSwitcher {
+                    guard runToken == token, !Task.isCancelled else { return false }
+                    dismissedSwitcher = try await app.openCompanionLauncherItem(labels: [], side: targetSide,
+                                                                                dismissSwitcher: true, session: session)
+                }
+            } while ContinuousClock.now < deadline
+            if onRead == nil { return opened }
+        } catch { return false }
+        let deadline = ContinuousClock.now + .seconds(15)
+        while runToken == token, !Task.isCancelled, ContinuousClock.now < deadline {
+            if let read = await confirmCompanionApp(target, side: targetSide, session: session, token: token) {
+                onRead?(read)
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(400))
+        }
+        return false
+    }
+
+    private func confirmCompanionApp(_ target: String, side: String, session: String, token: Int) async -> PokiCore.ToolAnswer? {
+        guard let poki = Bundle.main.bundleIdentifier else { return nil }
+        let read = await app.runTool("look", arguments: #"{"pane":"peer"}"#, localSession: session,
+                                     expectedApps: [target, poki])
+        guard runToken == token, !Task.isCancelled, !read.isError, read.jpeg != nil,
+              let pane = read.splitView, pane.app == target, pane.side == side else { return nil }
+        return read
+    }
+
+    private func openSplitViewPair(_ pair: [String], launchApps: [String: KnownApp], session: String, token: Int) async -> Bool {
         guard await app.reserveSplitViewWorkspace(session: session), !Task.isCancelled else { return false }
         let currentTask = task
         let background = UIApplication.shared.beginBackgroundTask(withName: "Open Poki Split View") { currentTask?.cancel() }
@@ -644,13 +765,42 @@ final class ChatModel {
         // destination, then open the source beside it, preserving the destination's last window.
         let anchor = pair[1]
         let source = pair[0]
+        if let placement = app.duoChatPlacement {
+            // Reuse the current workspace: open the destination beside Poki, then give
+            // Poki's former pane to the source. The current Home page is irrelevant.
+            do {
+                let alreadyInPlace = placement != "full"
+                    ? try await app.replaceChatPane(keeping: anchor, session: session)
+                    : false
+                if !alreadyInPlace {
+                    guard let target = launchApps[anchor],
+                          await openCompanionApp(target, placement: placement, session: session, token: token) else { return false }
+                    let releaseDeadline = ContinuousClock.now + .seconds(14)
+                    var released = false
+                    while runToken == token, !Task.isCancelled, ContinuousClock.now < releaseDeadline {
+                        released = try await app.replaceChatPane(keeping: anchor, session: session)
+                        if released { break }
+                        try await Task.sleep(for: .milliseconds(450))
+                    }
+                    guard released else { return false }
+                }
+                let deadline = ContinuousClock.now + .seconds(12)
+                while runToken == token, !Task.isCancelled, ContinuousClock.now < deadline {
+                    if try await app.replaceChatPane(keeping: anchor, opening: source, session: session) {
+                        return await confirmSplitViewPair(expected, session: session, token: token, seconds: 35) == .confirmed
+                    }
+                    try await Task.sleep(for: .milliseconds(450))
+                }
+            } catch { return false }
+            return false
+        }
         await activateForSplitView(anchor, session: session)
         switch await confirmSplitViewPair(expected, session: session, token: token, seconds: 12) {
         case .confirmed: return true
         case .stopped: return false
         case .unavailable, .differentPair: break
         }
-        guard runToken == token, !Task.isCancelled, let target = KnownApps.find(anchor) else { return false }
+        guard runToken == token, !Task.isCancelled, let target = launchApps[anchor] else { return false }
         guard await app.clearSplitViewPaneForSetup(session: session), runToken == token, !Task.isCancelled else { return false }
         AppLog.shared.add("chat", "opening the requested apps through the system Split View menu")
         await activateForSplitView("com.apple.springboard", session: session)
@@ -665,8 +815,9 @@ final class ChatModel {
     }
 
     private func activateForSplitView(_ bundle: String, session: String) async {
-        let request: JSON = ["actions": [["launch": .string(bundle)]]]
-        _ = await app.runTool("do", arguments: request.serialized(), localSession: session)
+        // Activation can finish with both apps visible. The pane read, rather than a single
+        // foreground app, is the confirmation that the requested workspace appeared.
+        try? await app.activateSplitViewSetupApp(bundle, session: session)
     }
 
     private func selectLauncherItem(_ labels: [String], menu: Bool, session: String) async throws -> Bool {
@@ -688,6 +839,7 @@ final class ChatModel {
         var pane = "left"
         while runToken == token, !Task.isCancelled, ContinuousClock.now < deadline {
             let read = await app.runTool("look", arguments: "{\"pane\":\"\(pane)\"}", localSession: session, expectedApps: pair)
+            guard runToken == token, !Task.isCancelled else { return .stopped }
             if read.text.contains("screen: locked") { return .stopped }
             if read.text.contains("do not match the planned Split View pair") { return .differentPair }
             // Keep the initial layout so a rotation before the model's first read also triggers recovery.
@@ -703,9 +855,11 @@ final class ChatModel {
         return Task.isCancelled || runToken != token ? .stopped : .unavailable
     }
 
-    private func chooseSplitView(text: String, apps: [String], provider: ModelProvider, model: Model) async -> WorkspaceChoice {
-        let names = apps.enumerated().map { "\($0.offset + 1). \(AppIconStore.name($0.element) ?? $0.element)" }.joined(separator: "\n")
-        let instructions = "Choose whether two candidate iPhone apps should work side by side for the owner's request. A word may describe an item and just happen to match an app name (for example 写一封邮件 can describe a message, or 照片 can mean an image in Safari). Select only the two apps actually requested. For a side-by-side task such as dragging, comparing, or transferring between two apps, output SPLIT followed by their two numbers separated by spaces, source first if there is a source. Otherwise output NORMAL. Output only that line."
+    private func chooseSplitView(text: String, apps: [KnownApp], allowCompanion: Bool, provider: ModelProvider, model: Model) async -> WorkspaceChoice {
+        let names = apps.enumerated().map { "\($0.offset + 1). \($0.element.name(in: .current))" }.joined(separator: "\n")
+        let instructions = """
+        Choose how to arrange the iPhone for the owner's task. Select an app only if the owner needs Poki to open or operate it. A name can be incidental: 写一封邮件 can describe a message, and 照片 can mean an image in Safari. For an interaction between two apps, such as dragging, comparing, or transferring between them, output SPLIT and their two numbers, source first. \(allowCompanion ? "If only one app is needed, output SINGLE and its number; Poki keeps the chat next to it." : "") For everything else, output NORMAL. Output one line.
+        """
         let planner = PiLoop(provider: provider, model: model, tools: []) { _ in
             PokiCore.ToolAnswer(text: "Planning only.", jpeg: nil, isError: true)
         }
@@ -719,9 +873,11 @@ final class ChatModel {
         let words = answer.split(whereSeparator: \.isWhitespace)
         if outcome == .done {
             if words == ["NORMAL"] { return .normal }
+            if allowCompanion, words.count == 2, words[0] == "SINGLE", let index = Int(words[1]),
+               (1...apps.count).contains(index) { return .companion(apps[index - 1].id) }
             if words.count == 3, words[0] == "SPLIT", let first = Int(words[1]), let second = Int(words[2]),
                first != second, (1...apps.count).contains(first), (1...apps.count).contains(second) {
-                return .split([apps[first - 1], apps[second - 1]])
+                return .split([apps[first - 1].id, apps[second - 1].id])
             }
         }
         return .failed(Self.splitViewPlanningMessage)
@@ -738,16 +894,18 @@ final class ChatModel {
     }
 
     private func modelLoop(provider: ModelProvider, model: Model, inSplitView: Bool) -> PiLoop {
-        let changedWorkspace = loop.map { $0.inSplitView != inSplitView } ?? false
+        let alongsidePoki = companionTarget != nil
+        let changedWorkspace = loop.map { $0.inSplitView != inSplitView || loopCompanionTarget != companionTarget } ?? false
         if let loop, loop.provider == provider, loop.model.id == model.id,
            loop.model.baseUrl == model.baseUrl, !changedWorkspace { return loop }
         // A different workspace starts without old screen evidence.
-        let next = PiLoop(provider: provider, model: model, tools: inSplitView ? Harness.splitViewTools : Harness.tools,
+        let next = PiLoop(provider: provider, model: model, tools: alongsidePoki ? Harness.companionTools : (inSplitView ? Harness.splitViewTools : Harness.tools),
                           inSplitView: inSplitView, carrying: changedWorkspace ? [] : loop?.messages ?? []) { [weak self] call in
             guard let self else { return PokiCore.ToolAnswer(text: "Task stopped. Action not executed.", jpeg: nil, isError: true) }
             return await self.perform(call)
         }
         loop = next
+        loopCompanionTarget = companionTarget
         return next
     }
 
@@ -786,9 +944,22 @@ final class ChatModel {
         guard !running, ChatModel.delegatedBusy == nil else { return ("Poki is already running a task.", false) }
         ChatModel.delegatedBusy = requester ?? AppLocalization.text(LocalizedStringResource("an agent"))
         defer { ChatModel.delegatedBusy = nil }
+        return await runSubmittedTask { send(task) }
+    }
+
+    /// A Realtime voice turn uses the same installed apps, workspace and pane checks as a typed message.
+    func runVoiceTask(_ request: String) async -> (text: String, success: Bool?) {
+        guard !running, Self.delegatedBusy == nil else { return ("Poki is already running a task.", false) }
+        return await runSubmittedTask { send(request, attachments: []) }
+    }
+
+    private func runSubmittedTask(_ submit: () -> Void) async -> (text: String, success: Bool?) {
+        guard !Task.isCancelled else { return ("Poki's task was cancelled.", false) }
+        let firstEntry = entries.count
         lastOutcome = nil
-        send(task)
-        if running, let started = self.task {
+        taskResult = nil
+        submit()
+        if running, let started = task {
             let token = runToken
             await withTaskCancellationHandler {
                 await started.value
@@ -802,7 +973,10 @@ final class ChatModel {
                 return ("Stopped. Poki's task was cancelled.", false)
             }
         }
-        let replies = entries.compactMap { entry -> String? in if case .poki(let text) = entry.kind { return text }; return nil }
+        let replies = entries.dropFirst(firstEntry).compactMap { entry -> String? in
+            if case .poki(let text) = entry.kind { return text }
+            return nil
+        }
         var lines: [String] = []
         if let taskResult {
             lines.append("result: \(taskResult.success ? "done" : "not done"): \(taskResult.summary)")
@@ -810,7 +984,10 @@ final class ChatModel {
         }
         if let last = replies.last { lines.append("Poki said: \(last)") }
         if case .failed(let why)? = lastOutcome { lines.append("error: \(why)") }
-        if lastOutcome == nil, let tail = entries.last, case .note(.problem(let why)) = tail.kind { lines.append("error: \(why)") }
+        if lastOutcome == nil, entries.count > firstEntry, let tail = entries.last, case .note(.problem(let why)) = tail.kind {
+            lines.append("error: \(why)")
+            return (lines.joined(separator: "\n"), false)
+        }
         if lines.isEmpty { lines.append("Poki ended without an answer.") }
         return (lines.joined(separator: "\n"), taskResult?.success)
     }
@@ -967,13 +1144,15 @@ final class ChatModel {
 
     private func performCall(_ call: ToolCall) async -> PokiCore.ToolAnswer {
         toolCalls += 1
-        let args = (call.arguments.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] ?? [:]
+        var args = (call.arguments.data(using: .utf8).flatMap { try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any] ?? [:]
+        let alongsidePoki = companionTarget != nil
+        if alongsidePoki, call.name == "look" { args["pane"] = "peer" }
         if usesSplitView {
             switch call.name {
             case "look":
                 if let pane = args["pane"] as? String {
                     hasSplitViewRead = false
-                    guard pane == "left" || pane == "right" else {
+                    guard alongsidePoki || pane == "left" || pane == "right" else {
                         return splitViewRefusal("Choose left or right with look. This task keeps both apps in Split View.")
                     }
                 } else if !hasSplitViewRead {
@@ -984,6 +1163,9 @@ final class ChatModel {
                     return splitViewRefusal("Use look with pane left or right to confirm the two visible apps first.")
                 }
                 let actions = args["actions"] as? [[String: Any]] ?? []
+                if alongsidePoki, actions.contains(where: { ($0["drag"] as? [String: Any])?["to_pane"] != nil }) {
+                    return splitViewRefusal("Keep input inside the target app beside the chat.")
+                }
                 if args["finish"] as? Bool == true || actions.contains(where: { $0["launch"] != nil || $0["run"] != nil || $0["button"] != nil }) {
                     return splitViewRefusal("Keep both apps in place. Do not launch apps, use hardware buttons, or run routines. Finish with finish_task.")
                 }
@@ -1019,13 +1201,16 @@ final class ChatModel {
             phoneStepUnderWay = true
             defer { phoneStepUnderWay = false }
             let taskToken = runToken
-            let response = await app.runTool(call.name, arguments: call.arguments, localSession: splitViewSession, expectedApps: expectedSplitViewApps)
+            let arguments = alongsidePoki && call.name == "look"
+                ? (try? JSONSerialization.data(withJSONObject: args)).map { String(decoding: $0, as: UTF8.self) } ?? call.arguments
+                : call.arguments
+            let response = await app.runTool(call.name, arguments: arguments, localSession: splitViewSession, expectedApps: expectedSplitViewApps)
             guard taskToken == runToken, usesSplitView else { return response }
             let changedLayout = call.name == "look" && lastSplitViewLayout != nil &&
                 response.splitView.map { $0.layout != lastSplitViewLayout } == true
             if let previous = lastSplitViewSide, response.splitViewNeedsRead || changedLayout {
                 hasSplitViewRead = false
-                let side = (args["pane"] as? String) ?? previous
+                let side = alongsidePoki ? "peer" : ((args["pane"] as? String) ?? previous)
                 return await recoverSplitView(side: side, token: taskToken,
                                               layoutSeen: changedLayout,
                                               action: call.name == "do" ? response : nil)
@@ -1068,25 +1253,29 @@ final class ChatModel {
             guard runToken == token, !Task.isCancelled else { break }
             // End on the pane expected by the original call, so the model's next action uses
             // the same side as the fresh screenshot it receives here.
-            let pane = otherRead == nil ? otherSide : side
+            let companion = companionTarget != nil
+            let pane = companion ? "peer" : (otherRead == nil ? otherSide : side)
             let read = await app.runTool("look", arguments: #"{"pane":"\#(pane)","full":true}"#,
                                          localSession: session, expectedApps: expected)
             guard runToken == token, !Task.isCancelled else { break }
-            guard !read.isError, read.jpeg != nil, let observed = read.splitView, observed.side == pane else {
+            guard !read.isError, read.jpeg != nil, let observed = read.splitView,
+                  companion ? observed.app == companionTarget : observed.side == pane else {
                 otherRead = nil
                 wait = .seconds(2)
                 app.chatWaitingForSplitView(true)
                 continue
             }
-            if pane == otherSide {
+            if !companion, pane == otherSide {
                 otherRead = observed
                 wait = .milliseconds(350)
                 continue
             }
-            guard let otherRead, otherRead.layout == observed.layout,
-                  otherRead.app == observed.otherApp, otherRead.otherApp == observed.app else {
-                otherRead = nil
-                continue
+            if !companion {
+                guard let otherRead, otherRead.layout == observed.layout,
+                      otherRead.app == observed.otherApp, otherRead.otherApp == observed.app else {
+                    otherRead = nil
+                    continue
+                }
             }
             recordSplitViewRead(observed)
             AppLog.shared.add("chat", "Split View restored; the model received a fresh pane read")

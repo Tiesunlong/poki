@@ -1,0 +1,96 @@
+name: Duo App Repro
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: xcode-27
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          XCODE="$(ls -d /Applications/Xcode_*.app | grep -v -i beta | sort -V | tail -1)"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            native/launcher/target
+          key: launcher-sim-${{ github.sha }}
+          restore-keys: launcher-
+      - name: Build PokiLauncher for simulator
+        run: |
+          native/launcher/fetch-idevice.sh
+          rustup default stable || (rustup update stable --no-self-update && rustup default stable)
+          rustup target add aarch64-apple-ios-sim
+          cargo build --release --locked --target aarch64-apple-ios-sim --manifest-path native/launcher/Cargo.toml
+      - name: Build Poki for Simulator
+        run: |
+          native/ios-app/scripts/make-assets.sh
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate --spec native/ios-app/project-external.yml
+          xcodebuild build \
+            -project native/ios-app/PokiExternal.xcodeproj -scheme Poki -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim \
+            CODE_SIGNING_ALLOWED=NO ARCHS=arm64 2>&1 | tee build/sim.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+      - name: Launch Poki on iPhone-Duo simulator and sample
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          xcrun simctl list -j > out/simctl.json
+          read -r RUNTIME TYPE < <(python3 - out/simctl.json <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          duo = [t for t in d["devicetypes"] if "Duo" in t["name"] or t.get("modelIdentifier") == "iPhone19,4" or "Duo" in t["identifier"]]
+          ids = {t["identifier"] for t in duo}
+          runtimes = [r for r in d["runtimes"] if r.get("platform", "iOS") == "iOS" and r["isAvailable"]]
+          for r in sorted(runtimes, key=lambda r: tuple(int(v) for v in r["version"].split(".")), reverse=True):
+              listed = [t["identifier"] for t in r.get("supportedDeviceTypes", []) if t["identifier"] in ids]
+              if listed:
+                  print(r["identifier"], listed[0]); break
+          PY
+          )
+          echo "Booting $TYPE on $RUNTIME"
+          UDID="$(xcrun simctl create duo-repro "$TYPE" "$RUNTIME")"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+
+          echo "=== Check simctl ui / io options for Duo inner screen ==="
+          xcrun simctl ui "$UDID" help 2>&1 || true
+          xcrun simctl io "$UDID" help 2>&1 || true
+
+          echo "=== Launch 1: default state ==="
+          PID=$(xcrun simctl launch "$UDID" nz.zheha.poki | awk '{print $NF}')
+          echo "Launched PID=$PID"
+          sleep 3
+          ps -p "$PID" -o pid,pcpu,pmem,time,comm || true
+          sample "$PID" 2 -file out/sample-default.txt 2>&1 || true
+          grep -A 35 "Call graph:" out/sample-default.txt | head -n 45 || true
+          xcrun simctl io "$UDID" screenshot out/default.png || true
+          xcrun simctl terminate "$UDID" nz.zheha.poki || true
+
+          echo "=== Launch 2: iPad Pro 11-inch landscape / 951x669 equivalent & Duo unfolded check ==="
+          IPAD_TYPE=$(python3 -c 'import json; d=json.load(open("out/simctl.json")); print([t["identifier"] for t in d["devicetypes"] if "iPad Pro 11" in t["name"]][0])')
+          UDID2="$(xcrun simctl create ipad-repro "$IPAD_TYPE" "$RUNTIME")"
+          xcrun simctl boot "$UDID2"
+          xcrun simctl bootstatus "$UDID2" -b
+          xcrun simctl install "$UDID2" build/sim/Build/Products/Debug-iphonesimulator/Poki.app
+          PID2=$(xcrun simctl launch "$UDID2" nz.zheha.poki | awk '{print $NF}')
+          sleep 3
+          ps -p "$PID2" -o pid,pcpu,pmem,time,comm || true
+          sample "$PID2" 2 -file out/sample-ipad.txt 2>&1 || true
+          grep -A 35 "Call graph:" out/sample-ipad.txt | head -n 45 || true
+          xcrun simctl shutdown "$UDID" || true
+          xcrun simctl shutdown "$UDID2" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: duo-repro
+          path: out/
